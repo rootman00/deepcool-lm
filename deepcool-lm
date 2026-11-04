@@ -37,10 +37,11 @@ class DisplayState:
     """Manages the current display state"""
 
     def __init__(self):
-        self.mode = "monitor"  # 'monitor', 'image', 'solid'
+        self.mode = "monitor"  # 'monitor', 'image', 'solid', 'gif'
         self.data = None  # Store image framebuffer or color
         self.lock = threading.Lock()
-        self.fps = None  # Store fps for gif
+        self.fps = None  # Optional fps override for gif
+        self.durations = None  # Per-frame durations (seconds) for gif
 
     def set_monitor_mode(self):
         with self.lock:
@@ -52,10 +53,11 @@ class DisplayState:
             self.mode = "image"
             self.data = framebuffer
 
-    def set_gif_mode(self, buffers, fps):
+    def set_gif_mode(self, buffers, durations=None, fps=None):
         with self.lock:
             self.mode = "gif"
             self.data = buffers
+            self.durations = durations
             self.fps = fps
 
     def set_solid_mode(self, framebuffer):
@@ -65,7 +67,7 @@ class DisplayState:
 
     def get_state(self):
         with self.lock:
-            return self.mode, self.data, self.fps
+            return self.mode, self.data, self.fps, self.durations
 
 
 class IPCServer:
@@ -161,10 +163,10 @@ class IPCServer:
                 restored_data = pickle.loads(gif_data)
                 gif_bytes = base64.b64decode(restored_data[0])
                 gif = Image.open(BytesIO(gif_bytes))
-                fps = restored_data[1]
-                buffers = process_gif(gif)
-                # print(f"buffers: {buffers.__len__()}", file=sys.stderr)
-                self.display_state.set_gif_mode(buffers, fps)
+                # fps is optional: None means "use the gif's native speed"
+                fps = restored_data[1] if len(restored_data) > 1 else None
+                buffers, durations = process_gif(gif)
+                self.display_state.set_gif_mode(buffers, durations, fps)
             else:
                 response = {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -334,10 +336,18 @@ def get_system_info():
     # CPU temperature
     try:
         temps = psutil.sensors_temperatures()
-        if "coretemp" in temps and len(temps["coretemp"]) > 0:
-            info["cpu_temp"] = round(temps["coretemp"][0].current, 1)
-        if "nvme" in temps and len(temps["nvme"]) > 0:
-            info["gpu_temp"] = round(temps["nvme"][0].current, 1)
+        # CPU: try AMD then Intel then generic
+        for key in ('k10temp', 'coretemp', 'cpu_thermal', 'zenpower'):
+            if key in temps and temps[key]:
+                pref = next((s.current for s in temps[key] if s.label in ('Tctl', 'Package id 0', 'Tdie')), None)
+                info['cpu_temp'] = round(pref if pref is not None else temps[key][0].current, 1)
+                break
+        # GPU: AMD then NVIDIA fallback
+        for key in ('amdgpu', 'nvidia', 'nouveau'):
+            if key in temps and temps[key]:
+                edge = next((s.current for s in temps[key] if s.label == 'edge'), None)
+                info['gpu_temp'] = round(edge if edge is not None else temps[key][0].current, 1)
+                break
     except:
         pass
 
@@ -471,30 +481,41 @@ def render_monitor_display(info, fonts):
 
 
 def process_gif(gif):
+    """Convert each gif frame to PNG and collect its display duration.
+
+    Returns (buffers, durations), where durations are in seconds per frame.
+    """
     res = []
+    durations = []
 
     for frame in ImageSequence.Iterator(gif):
+        # PIL exposes the current frame's delay in milliseconds.
+        delay_ms = frame.info.get("duration") or gif.info.get("duration") or 100
+        # Clamp absurd/zero delays so we never spin at 0 ms.
+        durations.append(max(int(delay_ms), 10) / 1000.0)
         ram_buffer = io.BytesIO()
         frame.save(ram_buffer, format="PNG")
         res.append(ram_buffer)
 
-    return res
+    return res, durations
 
 
-def gif_loop(buffers, fps, device):
-    sleep_time = 1 / fps
+def gif_loop(buffers, durations, fps, device):
     counter = 0
+    total = len(buffers)
     while True:
-        if counter == buffers.__len__():
-            counter = 0
         buffer = buffers[counter]
         buffer.seek(0)
         frame = Image.open(buffer)
         framebuffer = rgb_to_framebuffer(frame)
         device.send_frame(framebuffer)
-        counter += 1
-        print(f"gif mode: {counter}/{buffers.__len__()}", end="\r")
-        time.sleep(sleep_time)
+        if fps:
+            delay = 1.0 / fps
+        else:
+            delay = durations[counter]
+        counter = (counter + 1) % total
+        print(f"gif mode: {counter}/{total}", end="\r")
+        time.sleep(delay)
 
 
 # ============================================================================
@@ -524,9 +545,11 @@ def cmd_monitor(device, args):
     try:
         frame_count = 0
         buffers = None
+        durations = None
         while True:
             # Check current display mode
-            mode, data, fps = display_state.get_state()
+            mode, data, fps, frame_durations = display_state.get_state()
+            delay = args.interval
 
             if mode == "monitor":
                 # Generate and display monitoring frame
@@ -542,17 +565,23 @@ def cmd_monitor(device, args):
             elif mode == "gif":
                 if data:
                     buffers = data
+                    durations = frame_durations
 
-                buffer = buffers[(frame_count + 1) % (buffers.__len__())]
+                # Native speed unless --fps forces a fixed rate.
+                index = frame_count % len(buffers)
+                buffer = buffers[index]
                 buffer.seek(0)
-                # print(
-                #     f"[GIF] {(frame_count + 1) % (buffers.__len__())}/{buffers.__len__()} | frame: {frame_count} | buffers in None: {buffers is None} | fps: {fps}",
-                #     file=sys.stderr,
-                # )
                 img = Image.open(buffer)
                 framebuffer = rgb_to_framebuffer(img)
                 device.send_frame(framebuffer)
                 frame_count += 1
+
+                if fps:
+                    delay = 1.0 / fps
+                elif durations and index < len(durations):
+                    delay = durations[index]
+                else:
+                    delay = 1.0 / 30
             elif mode in ["image", "solid"]:
                 # Display static content
                 if data:
@@ -561,10 +590,7 @@ def cmd_monitor(device, args):
                         f"[{mode.upper()}] Displaying static content...                                                                ",
                         end="\r",
                     )
-            if mode == "gif":
-                time.sleep(1 / fps)
-            else:
-                time.sleep(args.interval)
+            time.sleep(delay)
     except KeyboardInterrupt:
         print(f"\n\nStopped after {frame_count} frames")
     finally:
@@ -609,9 +635,8 @@ def cmd_gif(device, args):
 
         with open(args.gif, "rb") as f:
             gif = base64.b64encode(f.read()).decode("utf-8")
-        if args.fps is None:
-            args.fps = 30
 
+        # fps=None -> the service uses the gif's native frame delays.
         prepared_data = pickle.dumps((gif, args.fps))
         gif_data = base64.b64encode(prepared_data).decode("utf-8")
         response = send_ipc_command({"action": "gif", "data": gif_data})
@@ -627,8 +652,8 @@ def cmd_gif(device, args):
 
     try:
         gif = Image.open(args.gif)
-        buffers = process_gif(gif)
-        gif_loop(buffers, args.fps, device)
+        buffers, durations = process_gif(gif)
+        gif_loop(buffers, durations, args.fps, device)
     except Exception as e:
         print(f"✗ Error loading gif: {e}")
         sys.exit(1)
@@ -733,9 +758,12 @@ Examples:
 
     # gif command
     gif_parser = subparsers.add_parser("gif", help="Display custom gif")
-    gif_parser.add_argument("gif", help="Path to gif file (will be resized to 320x420)")
+    gif_parser.add_argument("gif", help="Path to gif file (will be resized to 320x240)")
     gif_parser.add_argument(
-        "--fps", type=int, default=30, help="FPS for playing gif (default: 30)"
+        "--fps",
+        type=int,
+        default=None,
+        help="Force a fixed FPS instead of the gif's native frame delays",
     )
 
     # brightness command

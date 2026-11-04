@@ -17,5 +17,8 @@ User=root
 # Clean up stale socket file before starting
 ExecStartPre=-/bin/rm -f /var/run/deepcool-lm.sock
 
+# Show the gif on the LCD once the IPC socket is up (best-effort, never fails the unit)
+ExecStartPost=-/home/kirill/scripts/deepcool-lm-autostart-gif.sh
+
 [Install]
 WantedBy=sysinit.target
